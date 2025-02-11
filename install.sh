@@ -12,7 +12,7 @@ echo "Starting installation..."
 
 # Download the script
 echo "Downloading $SCRIPT_NAME from $REPO_URL..."
-wget -q "$REPO_URL/raw/main/$SCRIPT_NAME" -O "$SCRIPT_NAME"
+wget -q "$REPO_URL/raw/master/$SCRIPT_NAME" -O "$SCRIPT_NAME"
 if [[ $? -ne 0 ]]; then
     echo "Error: Failed to download the script. Check the repository URL."
     exit 1
