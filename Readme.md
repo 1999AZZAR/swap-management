@@ -1,171 +1,212 @@
-# Swap Manager
+# Swap Manager - Enhanced
 
-A comprehensive Linux swap management utility that provides control over ZRAM, ZSWAP, disk swap, and system swap parameters.
+A powerful Linux swap management utility with intuitive UI for controlling ZRAM, ZSWAP, disk swap, and system parameters.
 
 ## Features
 
-- Swap aggressiveness control with presets
-- ZRAM configuration and management
-- ZSWAP setup and control
-- Disk swap management
-- System parameter optimization
-- Comprehensive status reporting
+- **Modern Terminal UI** with color-coded output and intuitive menus
+- **Swap Aggressiveness Control** with 3 presets + custom settings
+- **ZRAM Management**:
+  - Temporary or persistent configuration
+  - Automatic size calculation based on RAM
+- **ZSWAP Configuration**:
+  - Compressor selection (lz4 by default)
+  - Pool size adjustment
+- **Disk Swap Management**:
+  - Swap files and partitions
+  - Safe removal procedure
+- **Comprehensive Status Reports** with colored output
+- **Auto Configuration** based on RAM multiplier (0.1x-3.0x)
+- **System Parameter Optimization**:
+  - Swappiness
+  - Cache pressure
+  - Dirty ratios
 
 ## Prerequisites
 
-- Root access
-- Linux kernel with ZRAM and ZSWAP support
-- systemd (for persistent ZRAM service)
+- **Root access** (required for swap operations)
+- **Linux kernel** with:
+  - ZRAM support (usually built-in)
+  - ZSWAP support (check with `grep -i zswap /boot/config-$(uname -r)`)
+- **systemd** (for persistent ZRAM service)
+- **Basic utilities**: `bc`, `modprobe`, `mkswap`
 
 ## Installation
 
-### manual
-
-1. Copy `swap_manager.sh` to `/usr/local/bin/`:
-   
-   ```bash
-   sudo cp swap_manager.sh /usr/local/bin/
-   sudo chmod +x /usr/local/bin/swap_manager.sh
-   ```
-
-2. create an alias to make it more ease (optopnal):
-   
-   ```
-   alias swap='sudo swap_manager.sh'
-   ```
-
-### Auto
-
-Just run this command :
+### Automated Installation
 
 ```bash
 wget -q https://github.com/1999AZZAR/swap-management/raw/main/install.sh -O install.sh && bash install.sh
 ```
 
-This command downloads and runs the installation script in one step
+This will:
+1. Install the script to `/usr/local/bin/swap-manager`
+2. Create a `swap` alias for easy access
+3. Set up logging and configuration directories
+
+### Manual Installation
+
+1. Download the script:
+
+```bash
+sudo wget -O /usr/local/bin/swap-manager https://raw.githubusercontent.com/1999AZZAR/swap-management/main/swap_manager.sh
+```
+
+2. Make it executable:
+
+```bash
+sudo chmod +x /usr/local/bin/swap-manager
+```
+
+3. (Optional) Create alias:
+
+```bash
+echo "alias swap='sudo swap-manager'" >> ~/.bashrc
+source ~/.bashrc
+```
 
 ## Usage
 
-Run the script as root:
+Run with:
 
 ```bash
-sudo swap_manager.sh
+sudo swap-manager
 ```
 
-or (if u created the alias (have been created when using the auto installer))
+Or using the alias (if created):
 
 ```bash
 swap
 ```
 
-### Menu Options
+### Main Menu Overview
 
-1. **Configure Swap Aggressiveness**
-   
-   - `a) Aggressive`: High swap usage (swappiness=100, cache_pressure=200)
-   - `b) Moderate`: Balanced settings (swappiness=60, cache_pressure=100)
-   - `c) Conservative`: Minimal swap usage (swappiness=10, cache_pressure=50)
-   - `d) Custom`: Set your own parameters
+```
+SWAP MEMORY MANAGEMENT SYSTEM
+=====================================
+ MAIN MENU
+=====================================
+  1) Auto Configuration
+  2) Configure Swap Aggressiveness
+  3) ZRAM Management
+  4) ZSWAP Management
+  5) Disk Swap Management
+  6) Check System Status
+  7) Exit
+```
 
-2. **ZRAM Management**
-   
-   - `a) Enable (this session)`: Temporary ZRAM configuration
-   - `b) Enable (persistent)`: Permanent ZRAM setup
-   - `c) Disable`: Remove ZRAM configuration
+### Detailed Feature Breakdown
 
-3. **ZSWAP Management**
-   
-   - `a) Enable`: Configure and activate ZSWAP
-   - `b) Disable`: Deactivate ZSWAP
+#### 1. Auto Configuration
+- **1.5x RAM**: Balanced configuration (75% ZSWAP, 25% ZRAM)
+- **2x RAM**: More aggressive swap allocation
+- **Custom Multiplier**: Set any value between 0.1-3.0
 
-4. **Disk Swap Management**
-   
-   - `a) Add swap`: Create swap file or partition
-   - `b) Remove swap`: Disable and remove swap
+*Example output during auto-configuration:*
+```
+Total RAM Size: 8192MB
+Total Swap Size (1.5x RAM): 12288MB
+Zswap Size (75%): 9216MB (9.00GB)
+ZRAM Size (25%): 3072MB (3.00GB)
+```
 
-5. **Check Status**: Display current system swap configuration
+#### 2. Swap Aggressiveness
+- **Presets**:
+  - 🚀 Aggressive (100/200/5/3)
+  - ⚖️ Moderate (60/100/20/10)
+  - 🐢 Conservative (10/50/40/20)
+- **Custom Settings**: Full control over all parameters
 
-### System Parameters
+#### 3. ZRAM Management
+- **Temporary Enable**: For current session only
+- **Persistent Enable**: Creates systemd service
+- **Disable**: Complete cleanup
 
-- **Swappiness** (vm.swappiness)
-  
-  - Range: 0-100
-  - Higher values: More aggressive swapping
-  - Lower values: Prefer keeping processes in RAM
+#### 4. ZSWAP Management
+- Toggle enabled/disabled state
+- Configured via GRUB (requires reboot)
 
-- **Cache Pressure** (vm.vfs_cache_pressure)
-  
-  - Range: 0-200
-  - Higher values: More aggressive cache clearing
-  - Lower values: Prefer keeping cache in RAM
+#### 5. Disk Swap Management
+- **Add Swap**:
+  - Files: Specify path and size (e.g., 2G)
+  - Partitions: Select block device
+- **Remove Swap**: Safely disable and clean up
 
-- **Dirty Ratio** (vm.dirty_ratio)
-  
-  - Range: 0-100
-  - Percentage of total RAM that can be dirty pages
-  - Higher values: More write caching
-  - Lower values: More frequent disk writes
-
-- **Dirty Background Ratio** (vm.dirty_background_ratio)
-  
-  - Range: 0-100
-  - Must be lower than dirty_ratio
-  - Threshold for background writeback
-
-## Presets
-
-### Aggressive
-
-- Swappiness: 100
-- Cache Pressure: 200
-- Dirty Ratio: 5
-- Dirty Background Ratio: 3
-- Best for: Systems with limited RAM
-
-### Moderate
-
-- Swappiness: 60
-- Cache Pressure: 100
-- Dirty Ratio: 20
-- Dirty Background Ratio: 10
-- Best for: General-purpose systems
-
-### Conservative
-
-- Swappiness: 10
-- Cache Pressure: 50
-- Dirty Ratio: 40
-- Dirty Background Ratio: 20
-- Best for: Systems with abundant RAM
+#### 6. System Status
+Comprehensive report including:
+- Current RAM/swap usage
+- ZRAM/ZSWAP status
+- System parameters
+- Configuration details
 
 ## Configuration Files
 
-- Config Directory: `/etc/swap-manager/`
-- Log File: `/var/log/swap-manager.log`
-- ZRAM Service: `/etc/systemd/system/zram.service`
+| Path | Purpose |
+|------|---------|
+| `/etc/swap-manager/` | Configuration directory |
+| `/var/log/swap-manager.log` | Detailed operation log |
+| `/etc/systemd/system/zram.service` | ZRAM service unit |
+
+## Best Practices
+
+### For Different System Types
+
+1. **Memory-constrained systems** (e.g., Raspberry Pi):
+   - Use Auto Config with 1.5x-2x multiplier
+   - Aggressive preset recommended
+
+2. **General desktop/laptop**:
+   - Moderate preset
+   - Consider 1x RAM for auto config
+
+3. **Servers with abundant RAM**:
+   - Conservative preset
+   - Lower multipliers (0.5x-1x)
+
+### Parameter Guidelines
+
+| Parameter | Recommended Range | Effect |
+|-----------|------------------|--------|
+| Swappiness | 10-100 | Higher = more swapping |
+| Cache Pressure | 50-200 | Higher = more cache reclaim |
+| Dirty Ratio | 5-40 | Higher = more write caching |
+| Dirty BG Ratio | 3-20 | Should be < Dirty Ratio |
 
 ## Troubleshooting
 
 ### Common Issues
 
-1. **ZRAM fails to enable**
-   
-   - Check kernel module: `lsmod | grep zram`
-   - Verify kernel support: `modinfo zram`
+**ZRAM not working**:
+1. Check kernel module:
+   ```bash
+   lsmod | grep zram
+   ```
+2. Verify device:
+   ```bash
+   ls -l /dev/zram*
+   ```
 
-2. **ZSWAP not working**
-   
-   - Check kernel parameters: `cat /proc/cmdline`
-   - Verify ZSWAP support: `cat /sys/module/zswap/parameters/enabled`
+**ZSWAP not enabled after reboot**:
+1. Check current parameters:
+   ```bash
+   cat /proc/cmdline | grep zswap
+   ```
+2. Verify module is loaded:
+   ```bash
+   lsmod | grep zswap
+   ```
 
-3. **Swap file creation fails**
-   
-   - Check available disk space: `df -h`
-   - Verify filesystem support for swap files
+**Swap file creation fails**:
+1. Check available space:
+   ```bash
+   df -h
+   ```
+2. Verify file creation:
+   ```bash
+   fallocate -l 1G testfile && rm testfile
+   ```
 
-### Logs
-
-Check the log file for detailed error messages:
+### Viewing Logs
 
 ```bash
 tail -f /var/log/swap-manager.log
@@ -173,10 +214,11 @@ tail -f /var/log/swap-manager.log
 
 ## Safety Notes
 
-- Always backup important data before modifying swap configuration
-- Changes to GRUB parameters require system reboot
-- Aggressive swap settings may impact system performance
-- Monitor system behavior after changing settings
+⚠️ **Important Considerations**:
+- Always test new configurations on non-critical systems first
+- Monitor system stability after changes
+- Reboot required for ZSWAP changes to take effect
+- Extreme settings may cause system instability
 
 ## License
 
