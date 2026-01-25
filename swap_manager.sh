@@ -37,6 +37,23 @@ declare -A SWAP_PRESETS=(
 )
 
 # Helper functions
+check_dependencies() {
+    local dependencies=("bc" "mkswap" "swapon" "swapoff" "modprobe" "fallocate" "free" "sysctl")
+    local missing_deps=()
+
+    for cmd in "${dependencies[@]}"; do
+        if ! command -v "$cmd" &>/dev/null; then
+            missing_deps+=("$cmd")
+        fi
+    done
+
+    if [[ ${#missing_deps[@]} -gt 0 ]]; then
+        print_error "Missing required dependencies: ${missing_deps[*]}"
+        print_info "Please install them using your package manager."
+        exit 1
+    fi
+}
+
 print_header() {
     clear
     echo -e "${BLUE}$DIVIDER"
@@ -255,16 +272,140 @@ configure_zswap() {
     if [[ "$enabled" == "true" ]]; then
         params="zswap.enabled=1 zswap.compressor=$compressor zswap.max_pool_percent=$pool_percent zswap.zpool=$zpool"
         print_info "Enabling ZSWAP with compressor: $compressor, max pool: $pool_percent%, pool type: $zpool"
+        
+        # Runtime configuration attempt
+        if [[ -w /sys/module/zswap/parameters/enabled ]]; then
+             # Try to set parameters first (ignore errors if some params are not writable or invalid)
+             [[ -w /sys/module/zswap/parameters/compressor ]] && echo "$compressor" > /sys/module/zswap/parameters/compressor 2>/dev/null
+             [[ -w /sys/module/zswap/parameters/max_pool_percent ]] && echo "$pool_percent" > /sys/module/zswap/parameters/max_pool_percent 2>/dev/null
+             [[ -w /sys/module/zswap/parameters/zpool ]] && echo "$zpool" > /sys/module/zswap/parameters/zpool 2>/dev/null
+             echo 1 > /sys/module/zswap/parameters/enabled 2>/dev/null
+             print_info "Applied runtime ZSWAP configuration."
+        fi
     else
         params="zswap.enabled=0"
         print_info "Disabling ZSWAP"
+        
+        # Runtime configuration attempt
+        if [[ -w /sys/module/zswap/parameters/enabled ]]; then
+             echo 0 > /sys/module/zswap/parameters/enabled 2>/dev/null
+             print_info "Disabled ZSWAP in runtime."
+        fi
     fi
 
-    cp /etc/default/grub /etc/default/grub.backup
-    sed -i "s/GRUB_CMDLINE_LINUX=\"\(.*\)\"/GRUB_CMDLINE_LINUX=\"\1 ${params}\"/" /etc/default/grub
-    update-grub
-    print_success "ZSWAP configuration updated. Reboot required."
-    log_info "ZSWAP configuration updated: $params"
+    # Determine bootloader update command
+    local update_cmd=""
+    if command -v update-grub &>/dev/null; then
+        update_cmd="update-grub"
+    elif command -v grub2-mkconfig &>/dev/null; then
+        update_cmd="grub2-mkconfig -o /boot/grub2/grub.cfg"
+    elif command -v grub-mkconfig &>/dev/null; then
+        update_cmd="grub-mkconfig -o /boot/grub/grub.cfg"
+    else
+        print_warning "No GRUB update command found. You may need to update your bootloader configuration manually."
+    fi
+
+    if [[ -f /etc/default/grub ]]; then
+        cp /etc/default/grub /etc/default/grub.backup
+        
+        # Remove existing zswap parameters
+        sed -i 's/zswap\.[^[:space:]"]*//g' /etc/default/grub
+        
+        # Add new parameters
+        sed -i "s/GRUB_CMDLINE_LINUX=\"\(.*\)\"/GRUB_CMDLINE_LINUX=\"\1 ${params}\"/" /etc/default/grub
+        
+        # Clean up double spaces
+        sed -i 's/  / /g' /etc/default/grub
+
+        if [[ -n "$update_cmd" ]]; then
+            print_info "Updating bootloader configuration..."
+            eval "$update_cmd"
+        fi
+        
+        print_success "ZSWAP configuration updated. Reboot required."
+        log_info "ZSWAP configuration updated: $params"
+    else
+        print_error "/etc/default/grub not found. Cannot configure ZSWAP automatically."
+        return 1
+    fi
+}
+
+change_zswap_algorithm() {
+    # Detect supported algorithms from kernel crypto API
+    if [[ ! -f /proc/crypto ]]; then
+        print_error "/proc/crypto not found. Cannot detect algorithms."
+        return
+    fi
+
+    local current_algo
+    current_algo=$(cat /sys/module/zswap/parameters/compressor 2>/dev/null || echo "unknown")
+
+    print_info "Scanning kernel crypto modules for supported compression algorithms..."
+    
+    # Extract names associated with 'scomp' (synchronous compression) or 'compression' types
+    local available_algos
+    available_algos=$(awk '/type: scomp|type: compression/ {found=1} found && /name/ {print $3; found=0}' /proc/crypto | sort -u | tr '\n' ' ')
+
+    if [[ -z "$available_algos" ]]; then
+        print_warning "Could not auto-detect algorithms. Using common defaults."
+        available_algos="lzo lz4 zstd lzo-rle 842"
+    fi
+
+    echo -e "${YELLOW}Available Algorithms:${NC}"
+    echo "$available_algos" | tr ' ' '\n' | sed 's/^/  - /'
+    echo -e "Current: ${GREEN}$current_algo${NC}"
+    
+    echo
+    local choice
+    read -rp "Enter algorithm name: " choice
+    [[ -z "$choice" ]] && return
+
+    # Validate input against available list (strict check)
+    if ! echo "$available_algos" | grep -q "\b$choice\b"; then
+        print_error "Algorithm '$choice' does not appear to be supported by your kernel."
+        return
+    fi
+
+    # Runtime update
+    if [[ -w /sys/module/zswap/parameters/compressor ]]; then
+        print_info "Attempting runtime update..."
+        
+        # Check if ZSWAP is enabled
+        local was_enabled=0
+        if [[ $(cat /sys/module/zswap/parameters/enabled 2>/dev/null) == "Y" ]]; then
+            was_enabled=1
+        fi
+
+        # We must often disable ZSWAP to change the compressor if pages are stored
+        if [[ $was_enabled -eq 1 ]]; then
+            echo 0 > /sys/module/zswap/parameters/enabled
+        fi
+
+        if echo "$choice" > /sys/module/zswap/parameters/compressor; then
+            print_success "Runtime compressor updated to $choice"
+        else
+            print_error "Failed to update runtime compressor. It might be in use."
+            # Try to restore enabled state if it failed
+            [[ $was_enabled -eq 1 ]] && echo 1 > /sys/module/zswap/parameters/enabled
+            return 1
+        fi
+
+        # Re-enable if it was enabled
+        if [[ $was_enabled -eq 1 ]]; then
+            echo 1 > /sys/module/zswap/parameters/enabled
+        fi
+    else
+        print_warning "Runtime parameters not writable. Changes will only apply after reboot."
+    fi
+
+    # Persistent update (GRUB)
+    print_info "Updating persistent configuration..."
+    # We reuse configure_zswap but keep existing values for other params
+    local pool_percent zpool
+    pool_percent=$(cat /sys/module/zswap/parameters/max_pool_percent 2>/dev/null || echo "$DEFAULT_ZSWAP_MAX_POOL_PERCENT")
+    zpool=$(cat /sys/module/zswap/parameters/zpool 2>/dev/null || echo "$DEFAULT_ZSWAP_ZPOOL")
+    
+    configure_zswap "true" "$choice" "$pool_percent" "$zpool"
 }
 
 # Disk swap management
@@ -273,14 +414,53 @@ configure_disk_swap() {
     local location=$2
     local size=$3
 
+    # Check if swap is already active
+    if swapon --show | grep -q "$location"; then
+        print_error "Swap at $location is already active"
+        return 1
+    fi
+
+    # Check for existing fstab entry
+    if grep -q "$location" /etc/fstab; then
+        print_warning "Entry for $location already exists in /etc/fstab"
+    fi
+
     case "$type" in
     "partition")
         validate_device "$location" || return 1
+        
+        # Confirm before formatting partition
+        read -rp "WARNING: This will format $location. All data will be lost. Continue? (y/N): " confirm
+        [[ "$confirm" =~ ^[Yy]$ ]] || { print_info "Operation cancelled"; return 1; }
+        
         mkswap "$location"
         ;;
     "file")
         validate_path "$location" || return 1
         validate_size "$size" || return 1
+        
+        if [[ -f "$location" ]]; then
+            print_error "File $location already exists. Choose a different location or remove the file first."
+            return 1
+        fi
+        
+        # Check available disk space
+        local dir_path=$(dirname "$location")
+        local available_space=$(df -k --output=avail "$dir_path" | tail -n1)
+        # Convert size string (e.g., 1G) to KB
+        local size_kb
+        if [[ "$size" =~ G$ ]]; then
+            size_kb=$((${size%G} * 1024 * 1024))
+        elif [[ "$size" =~ M$ ]]; then
+            size_kb=$((${size%M} * 1024))
+        fi
+        
+        if [[ $available_space -lt $size_kb ]]; then
+            print_error "Insufficient disk space. Available: $((available_space/1024))MB, Required: $((size_kb/1024))MB"
+            return 1
+        fi
+
+        print_info "Allocating swap file (this may take a moment)..."
         fallocate -l "$size" "$location"
         chmod 600 "$location"
         mkswap "$location"
@@ -292,18 +472,144 @@ configure_disk_swap() {
     esac
 
     swapon "$location"
-    echo "$location none swap sw 0 0" >>/etc/fstab
+    
+    # Add to fstab if not present
+    if ! grep -q "$location" /etc/fstab; then
+        echo "$location none swap sw 0 0" >>/etc/fstab
+    fi
+    
     print_success "Disk swap configured: $location"
     log_info "Disk swap configured at $location with size ${size:-N/A}"
 }
 
 disable_disk_swap() {
     local location=$1
-    swapoff "$location" 2>/dev/null || true
-    sed -i "\|$location|d" /etc/fstab
-    [[ -f "$location" ]] && rm -f "$location"
+    
+    if ! swapon --show | grep -q "$location"; then
+        print_warning "Swap at $location is not active"
+    else
+        print_info "Disabling swap at $location..."
+        if ! swapoff "$location"; then
+            print_error "Failed to disable swap at $location. Operation aborted."
+            return 1
+        fi
+    fi
+
+    # Remove from fstab
+    if grep -q "$location" /etc/fstab; then
+        # Create backup of fstab
+        cp /etc/fstab /etc/fstab.bak
+        # Safe deletion using temporary file
+        grep -v "$location" /etc/fstab > /etc/fstab.tmp && mv /etc/fstab.tmp /etc/fstab
+        print_info "Removed entry from /etc/fstab"
+    fi
+
+    if [[ -f "$location" ]]; then
+        read -rp "Do you want to delete the swap file $location? (y/N): " confirm
+        if [[ "$confirm" =~ ^[Yy]$ ]]; then
+            rm -f "$location"
+            print_success "Swap file deleted"
+        else
+            print_info "Swap file kept at $location"
+        fi
+    fi
+    
     print_success "Disk swap disabled: $location"
     log_info "Disk swap disabled at $location"
+}
+
+change_disk_swap_priority() {
+    echo -e "\n${YELLOW}Active Swap Devices:${NC}"
+    swapon --show --noheadings --output NAME,PRIO,TYPE | nl
+    
+    echo
+    read -rp "Enter path of swap to modify (e.g., /swapfile): " location
+    [[ -z "$location" ]] && return
+
+    if ! swapon --show | grep -q "$location"; then
+        print_error "Swap $location is not active"
+        return
+    fi
+
+    local new_prio
+    new_prio=$(validate_input "Enter new priority (-1 to 32767): " "^-?[0-9]+$" "Invalid integer")
+
+    if ! swapoff "$location"; then
+        print_error "Failed to disable swap. Cannot change priority."
+        return
+    fi
+
+    # Update fstab if present
+    if grep -q "$location" /etc/fstab; then
+        # Remove existing pri option if present
+        sed -i "s/,pri=[0-9-]*//g" /etc/fstab
+        
+        # Add new priority to the options
+        if grep -q "$location.*sw" /etc/fstab; then
+             sed -i "s|\($location.*sw\)|\1,pri=$new_prio|" /etc/fstab
+        elif grep -q "$location.*defaults" /etc/fstab; then
+             sed -i "s|\($location.*defaults\)|\1,pri=$new_prio|" /etc/fstab
+        fi
+    fi
+
+    if swapon -p "$new_prio" "$location"; then
+        print_success "Priority changed to $new_prio"
+        log_info "Changed priority of $location to $new_prio"
+    else
+        print_error "Failed to re-enable swap"
+        log_error "Failed to re-enable swap $location after priority change"
+    fi
+}
+
+resize_disk_swap() {
+    echo -e "\n${YELLOW}Active Swap Files:${NC}"
+    swapon --show --noheadings --output NAME,TYPE,SIZE | grep "file" | nl
+    
+    echo
+    read -rp "Enter path of swap file to resize: " location
+    [[ -z "$location" ]] && return
+
+    if [[ ! -f "$location" ]]; then
+        print_error "File not found or not a regular file"
+        return
+    fi
+
+    local current_size
+    current_size=$(du -h "$location" | cut -f1)
+    print_info "Current size: $current_size"
+
+    local new_size
+    new_size=$(validate_input "Enter new size (e.g., 2G, 512M): " "^[0-9]+[GgMmKk]$" "Invalid format")
+
+    print_warning "This involves disabling swap, which may fail if memory is full."
+    read -rp "Continue? (y/N): " confirm
+    [[ "$confirm" =~ ^[Yy]$ ]] || return
+
+    if ! swapoff "$location"; then
+        print_error "Failed to disable swap. Aborting resize."
+        return
+    fi
+
+    print_info "Resizing..."
+    if ! fallocate -l "$new_size" "$location"; then
+        print_error "Failed to resize file. Restoring old swap..."
+        mkswap "$location" &>/dev/null
+        swapon "$location"
+        return 1
+    fi
+
+    chmod 600 "$location"
+    if ! mkswap "$location"; then
+         print_error "Failed to format swap. File may be corrupted."
+         return 1
+    fi
+
+    if swapon "$location"; then
+        print_success "Swap resized to $new_size"
+        log_info "Resized swap file $location to $new_size"
+    else
+        print_error "Failed to re-enable swap"
+    fi
 }
 
 # Auto-configuration based on RAM size
@@ -534,33 +840,126 @@ show_aggressiveness_menu() {
     done
 }
 
+change_zram_algorithm() {
+    # If module is not loaded, load it to see available algorithms
+    if ! lsmod | grep -q zram; then
+        print_info "Loading ZRAM module to detect supported algorithms..."
+        modprobe zram num_devices=1 || {
+            print_error "Failed to load zram module."
+            return
+        }
+        sleep 1
+    fi
+
+    local dev="/dev/zram0"
+    local algos_file="/sys/block/zram0/comp_algorithm"
+    
+    if [[ ! -f "$algos_file" ]]; then
+        print_error "ZRAM sysfs interface not found at $algos_file"
+        return
+    fi
+
+    local current_algos
+    current_algos=$(cat "$algos_file")
+    # Clean up the output to show which one is selected
+    echo -e "${YELLOW}Available Algorithms (current in brackets):${NC}"
+    echo "$current_algos"
+    
+    echo
+    local choice
+    read -rp "Enter algorithm name (e.g., lz4, zstd, lzo): " choice
+    
+    if [[ -z "$choice" ]]; then return; fi
+    
+    # Check if choice is in available algos (literal check)
+    if ! echo "$current_algos" | grep -q "\b$choice\b"; then
+        print_error "Algorithm '$choice' not supported by your kernel."
+        return
+    fi
+
+    # Check if currently active
+    local was_active=false
+    if swapon --show | grep -q "$dev"; then
+        was_active=true
+        print_info "ZRAM is currently active. Disabling to change algorithm..."
+        if ! swapoff "$dev"; then
+            print_error "Failed to disable ZRAM. Algorithm change aborted."
+            return
+        fi
+    fi
+    
+    # Reset and apply
+    print_info "Applying algorithm $choice..."
+    echo 1 > /sys/block/zram0/reset 2>/dev/null || true
+    if ! echo "$choice" > "$algos_file"; then
+        print_error "Failed to set algorithm. It might be in use or unsupported."
+        return
+    fi
+    
+    # If it was active, re-enable it. If not, just leave it with the new algo set.
+    if [[ "$was_active" == "true" ]]; then
+        local ram_mb
+        ram_mb=$(free -m | awk '/^Mem:/ { print $2 }')
+        local default_size="$((ram_mb / 4))M"
+        
+        print_info "Re-enabling ZRAM..."
+        echo "$default_size" > /sys/block/zram0/disksize
+        mkswap "$dev" >/dev/null
+        swapon "$dev"
+        print_success "ZRAM re-enabled with $choice compression."
+    else
+        print_success "ZRAM compression algorithm set to $choice. It will be used next time ZRAM is enabled."
+    fi
+}
+
 show_zram_menu() {
     while true; do
         print_header
         print_submenu_header "ZRAM MANAGEMENT"
-        echo -e "  ${GREEN}1)${NC} Enable ZRAM (current session)"
-        echo -e "  ${GREEN}2)${NC} Enable ZRAM (persistent)"
-        echo -e "  ${RED}3)${NC} Disable ZRAM"
-        echo -e "  ${RED}4)${NC} Back to main menu"
-        echo
+        
+        # Check if ZRAM is active
+        local is_active=false
+        if swapon --show | grep -q "/dev/zram0"; then
+            is_active=true
+        fi
 
-        local choice
-        choice=$(validate_input "Select option [1-4]: " "^[1-4]$" "Please enter a number between 1 and 4")
-
-        case $choice in
-        1)
-            local size
-            size=$(validate_input "Enter ZRAM size (e.g., 1G, 2M): " "^[0-9]+[GgMmKk]$" "Invalid size format")
-            configure_zram "$size"
-            ;;
-        2)
-            local size
-            size=$(validate_input "Enter ZRAM size (e.g., 1G, 2M): " "^[0-9]+[GgMmKk]$" "Invalid size format")
-            configure_zram "$size" && create_zram_service "$size"
-            ;;
-        3) disable_zram ;;
-        4) return ;;
-        esac
+        if [[ "$is_active" == "true" ]]; then
+            echo -e "  ${RED}1)${NC} Disable ZRAM"
+            echo -e "  ${GREEN}2)${NC} Change Compression Algorithm"
+            echo -e "  ${RED}3)${NC} Back to main menu"
+            
+            local choice
+            choice=$(validate_input "Select option [1-3]: " "^[1-3]$" "Please enter a number between 1 and 3")
+            
+            case $choice in
+            1) disable_zram ;;
+            2) change_zram_algorithm ;;
+            3) return ;;
+            esac
+        else
+            echo -e "  ${GREEN}1)${NC} Enable ZRAM (current session)"
+            echo -e "  ${GREEN}2)${NC} Enable ZRAM (persistent)"
+            echo -e "  ${GREEN}3)${NC} Change Compression Algorithm"
+            echo -e "  ${RED}4)${NC} Back to main menu"
+            
+            local choice
+            choice=$(validate_input "Select option [1-4]: " "^[1-4]$" "Please enter a number between 1 and 4")
+            
+            case $choice in
+            1)
+                local size
+                size=$(validate_input "Enter ZRAM size (e.g., 1G, 2M): " "^[0-9]+[GgMmKk]$" "Invalid size format")
+                configure_zram "$size"
+                ;;
+            2)
+                local size
+                size=$(validate_input "Enter ZRAM size (e.g., 1G, 2M): " "^[0-9]+[GgMmKk]$" "Invalid size format")
+                configure_zram "$size" && create_zram_service "$size"
+                ;;
+            3) change_zram_algorithm ;;
+            4) return ;;
+            esac
+        fi
 
         press_enter_to_continue
     done
@@ -570,19 +969,64 @@ show_zswap_menu() {
     while true; do
         print_header
         print_submenu_header "ZSWAP MANAGEMENT"
-        echo -e "  ${GREEN}1)${NC} Enable ZSWAP"
-        echo -e "  ${RED}2)${NC} Disable ZSWAP"
-        echo -e "  ${RED}3)${NC} Back to main menu"
-        echo
+        
+        local zswap_state="N"
+        if [[ -f "/sys/module/zswap/parameters/enabled" ]]; then
+            zswap_state=$(cat /sys/module/zswap/parameters/enabled)
+        fi
 
-        local choice
-        choice=$(validate_input "Select option [1-3]: " "^[1-3]$" "Please enter a number between 1 and 3")
+        if [[ "$zswap_state" == "Y" ]]; then
+             echo -e "  ${RED}1)${NC} Disable ZSWAP"
+             echo -e "  ${GREEN}2)${NC} Change Compression Algorithm"
+             echo -e "  ${RED}3)${NC} Back to main menu"
+             
+             local choice
+             choice=$(validate_input "Select option [1-3]: " "^[1-3]$" "Please enter a number between 1 and 3")
 
-        case $choice in
-        1) configure_zswap "true" ;;
-        2) configure_zswap "false" ;;
-        3) return ;;
-        esac
+             case $choice in
+             1) configure_zswap "false" ;;
+             2) change_zswap_algorithm ;;
+             3) return ;;
+             esac
+        else
+             echo -e "  ${GREEN}1)${NC} Enable ZSWAP (Default)"
+             echo -e "  ${GREEN}2)${NC} Enable ZSWAP (Custom)"
+             echo -e "  ${RED}3)${NC} Back to main menu"
+             
+             local choice
+             choice=$(validate_input "Select option [1-3]: " "^[1-3]$" "Please enter a number between 1 and 3")
+
+             case $choice in
+             1) configure_zswap "true" ;;
+             2) 
+                local compressor pool_percent zpool
+                # Get current values or defaults
+                local cur_comp=$(cat /sys/module/zswap/parameters/compressor 2>/dev/null || echo "$DEFAULT_ZSWAP_COMPRESSOR")
+                local cur_pool=$(cat /sys/module/zswap/parameters/max_pool_percent 2>/dev/null || echo "$DEFAULT_ZSWAP_MAX_POOL_PERCENT")
+                local cur_zpool=$(cat /sys/module/zswap/parameters/zpool 2>/dev/null || echo "$DEFAULT_ZSWAP_ZPOOL")
+                
+                # Pre-scan for compressors to show user what's available
+                print_info "Scanning supported algorithms..."
+                local available_algos
+                if [[ -f /proc/crypto ]]; then
+                     available_algos=$(awk '/type: scomp|type: compression/ {found=1} found && /name/ {print $3; found=0}' /proc/crypto | sort -u | tr '\n' ' ')
+                fi
+                echo -e "${YELLOW}Available:${NC} ${available_algos:-lzo lz4 zstd}"
+                
+                read -rp "Compressor (default: $cur_comp): " compressor
+                [[ -z "$compressor" ]] && compressor=$cur_comp
+                
+                read -rp "Max Pool Percent (default: $cur_pool): " pool_percent
+                [[ -z "$pool_percent" ]] && pool_percent=$cur_pool
+                
+                read -rp "Zpool allocator (default: $cur_zpool): " zpool
+                [[ -z "$zpool" ]] && zpool=$cur_zpool
+                
+                configure_zswap "true" "$compressor" "$pool_percent" "$zpool"
+                ;;
+             3) return ;;
+             esac
+        fi
 
         press_enter_to_continue
     done
@@ -593,12 +1037,14 @@ show_disk_swap_menu() {
         print_header
         print_submenu_header "DISK SWAP MANAGEMENT"
         echo -e "  ${GREEN}1)${NC} Add swap"
-        echo -e "  ${RED}2)${NC} Remove swap"
-        echo -e "  ${RED}3)${NC} Back to main menu"
+        echo -e "  ${GREEN}2)${NC} Remove swap"
+        echo -e "  ${GREEN}3)${NC} Change swap priority"
+        echo -e "  ${GREEN}4)${NC} Resize swap file"
+        echo -e "  ${RED}5)${NC} Back to main menu"
         echo
 
         local choice
-        choice=$(validate_input "Select option [1-3]: " "^[1-3]$" "Please enter a number between 1 and 3")
+        choice=$(validate_input "Select option [1-5]: " "^[1-5]$" "Please enter a number between 1 and 5")
 
         case $choice in
         1)
@@ -611,11 +1057,18 @@ show_disk_swap_menu() {
             configure_disk_swap "$type" "$location" "$size"
             ;;
         2)
-            local location
-            read -rp "Enter swap location to remove: " location
-            disable_disk_swap "$location"
+            echo -e "\n${YELLOW}Active Swap Devices:${NC}"
+            swapon --show --noheadings --output NAME,TYPE,SIZE | nl
+            
+            echo
+            read -rp "Enter path of swap to remove (or leave empty to cancel): " location
+            if [[ -n "$location" ]]; then
+                disable_disk_swap "$location"
+            fi
             ;;
-        3) return ;;
+        3) change_disk_swap_priority ;;
+        4) resize_disk_swap ;;
+        5) return ;;
         esac
 
         press_enter_to_continue
@@ -663,6 +1116,9 @@ main() {
         print_error "Must run as root"
         exit 1
     }
+    
+    check_dependencies
+    
     mkdir -p "$CONFIG_DIR"
     touch "$LOG_FILE"
     chmod 640 "$LOG_FILE"
